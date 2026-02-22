@@ -1,5 +1,8 @@
 # personas
 
+<img width="300" height="165" alt="Screenshot 2026-02-22 at 2 59 24 PM" src="https://github.com/user-attachments/assets/08c7b7a2-2d26-4612-9529-c5814079d0b8" />
+
+
 A small, public collection of persona assets used across the `tjamescouch/*` agent ecosystem.
 
 Today this repo primarily contains **Ellie** (a character/persona + associated assets).
