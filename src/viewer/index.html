@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ellie — LFS Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #1a1a2e; font-family: system-ui, -apple-system, sans-serif; }
+    canvas { display: block; }
+
+    #overlay {
+      position: fixed; top: 0; left: 0; right: 0;
+      pointer-events: none; z-index: 10;
+      padding: 12px 16px;
+      display: flex; justify-content: space-between; align-items: flex-start;
+    }
+
+    #status {
+      color: #7f8c8d; font-size: 12px; font-family: monospace;
+      background: rgba(0,0,0,0.3); padding: 4px 8px; border-radius: 4px;
+    }
+    #status.connected { color: #2ecc71; }
+
+    #controls {
+      pointer-events: auto;
+      display: flex; gap: 8px;
+    }
+    #controls button {
+      background: rgba(255,255,255,0.1); color: #ccc; border: 1px solid rgba(255,255,255,0.2);
+      padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;
+      font-family: monospace;
+    }
+    #controls button:hover { background: rgba(255,255,255,0.2); color: #fff; }
+
+    #signal-debug {
+      position: fixed; bottom: 12px; left: 16px;
+      color: #2ecc71; font-family: monospace; font-size: 11px;
+      background: rgba(0,0,0,0.3); padding: 4px 8px; border-radius: 4px;
+      white-space: pre; z-index: 10;
+    }
+
+    #loading {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      color: #7f8c8d; font-size: 14px; font-family: monospace; z-index: 20;
+    }
+    #loading .bar {
+      width: 200px; height: 3px; background: rgba(255,255,255,0.1);
+      border-radius: 2px; margin-top: 8px; overflow: hidden;
+    }
+    #loading .fill {
+      height: 100%; width: 0%; background: #2ecc71; transition: width 0.2s;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <span id="status">Initializing...</span>
+    <div id="controls">
+      <button id="btn-demo">Start Demo</button>
+    </div>
+  </div>
+  <div id="signal-debug"></div>
+  <div id="loading">
+    Loading Ellie...
+    <div class="bar"><div class="fill" id="load-fill"></div></div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import { AvatarController } from "./avatar-controller.mjs";
+    import { LfsClient } from "./lfs-client.mjs";
+
+    const statusEl = document.getElementById("status");
+    const debugEl = document.getElementById("signal-debug");
+    const loadingEl = document.getElementById("loading");
+    const loadFill = document.getElementById("load-fill");
+    const btnDemo = document.getElementById("btn-demo");
+
+    // Load avatar
+    const avatar = new AvatarController(document.body);
+    avatar.setDebugElement(debugEl);
+
+    try {
+      await avatar.load("/ellie/ellie_animation.glb", (xhr) => {
+        if (xhr.lengthComputable) {
+          const pct = Math.round((xhr.loaded / xhr.total) * 100);
+          loadFill.style.width = pct + "%";
+          loadingEl.firstChild.textContent = `Loading Ellie... ${pct}%`;
+        }
+      });
+      loadingEl.style.display = "none";
+    } catch (err) {
+      loadingEl.firstChild.textContent = `Failed to load: ${err.message}`;
+      loadFill.style.background = "#e74c3c";
+      loadFill.style.width = "100%";
+    }
+
+    // Start animation loop
+    avatar.animate();
+
+    // Connect SSE
+    const client = new LfsClient("/api/signals");
+
+    client.on("signal", (sig) => avatar.applySignal(sig));
+
+    client.on("status", (s) => {
+      statusEl.textContent = s;
+      statusEl.classList.toggle("connected", s.includes("Connected"));
+    });
+
+    client.connect();
+
+    // Demo button
+    let demoActive = false;
+    btnDemo.addEventListener("click", async () => {
+      demoActive = !demoActive;
+      const endpoint = demoActive ? "/api/demo/start" : "/api/demo/stop";
+      await fetch(endpoint, { method: "POST" });
+      btnDemo.textContent = demoActive ? "Stop Demo" : "Start Demo";
+    });
+  </script>
+</body>
+</html>
