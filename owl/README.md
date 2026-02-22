@@ -1,8 +1,3 @@
-You got it. If we are going to build this so it actually works in real-time, a surface-level spec won't cut it. We need to handle asynchronous token streaming, sentence-boundary chunking for the TTS, and concurrent PyTorch inference for the frame generation—all without blocking the main event loop.
-
-Here is the substantive OWL specification. It defines the exact data contracts, async boundaries, and hardware constraints needed for an agent to build a production-ready rendering pipeline.
-
-Create these files in your `personas` repository.
 
 ### `product.md`
 
@@ -124,9 +119,3 @@ Handles the consumption of rendered frames and audio to ensure smooth playback t
 3. **UI Overlay:** Apply any static UI elements (like the 'gro.' logo) in a fast 2D drawing pass *after* the neural distortion, ensuring UI elements do not warp with the facial mesh.
 
 ```
-
----
-
-This structure gives an AI agent everything it needs to understand *what* must be built, the exact data contracts between the queues, and the strict rules it must follow for your Mac Studio's hardware.
-
-Would you like me to generate the complete Python implementation for the `stream_parser.md` component so you have a working demultiplexer to test with your LLM?
