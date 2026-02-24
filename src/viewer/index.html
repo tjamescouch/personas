@@ -40,6 +40,19 @@
       white-space: pre; z-index: 10;
     }
 
+    #text-panel {
+      position: fixed; right: 16px; top: 48px; bottom: 48px; width: 340px;
+      background: rgba(0,0,0,0.55); border-radius: 8px; padding: 14px 16px;
+      color: #e0e0e0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px;
+      line-height: 1.5; overflow-y: auto; z-index: 10;
+      white-space: pre-wrap; word-wrap: break-word;
+      border: 1px solid rgba(255,255,255,0.08);
+      scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.15) transparent;
+    }
+    #text-panel:empty { display: none; }
+    #text-panel::-webkit-scrollbar { width: 5px; }
+    #text-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+
     #loading {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
       color: #7f8c8d; font-size: 14px; font-family: monospace; z-index: 20;
@@ -61,6 +74,7 @@
     </div>
   </div>
   <div id="signal-debug"></div>
+  <div id="text-panel"></div>
   <div id="loading">
     Loading Ellie...
     <div class="bar"><div class="fill" id="load-fill"></div></div>
@@ -84,6 +98,7 @@
     const debugEl = document.getElementById("signal-debug");
     const loadingEl = document.getElementById("loading");
     const loadFill = document.getElementById("load-fill");
+    const textEl = document.getElementById("text-panel");
 
     // Load avatar
     const avatar = window._avatar = new AvatarController(document.body);
@@ -111,8 +126,15 @@
     const client = new LfsClient("/api/signals");
 
     client.on("signal", (sig) => {
-      if (sig.type === "animate") console.log("animate:", sig.clips);
-      avatar.applySignal(sig);
+      if (sig.type === "text_control" && sig.action === "start") {
+        textEl.textContent = "";
+      } else if (sig.type === "text") {
+        textEl.textContent += sig.chunk;
+        textEl.scrollTop = textEl.scrollHeight;
+      } else {
+        if (sig.type === "animate") console.log("animate:", sig.clips);
+        avatar.applySignal(sig);
+      }
     });
 
     client.on("status", (s) => {
