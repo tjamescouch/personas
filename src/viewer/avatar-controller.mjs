@@ -61,13 +61,21 @@ export class AvatarController {
     for (const clip of gltf.animations) this._clipsByName[clip.name] = clip;
     const clipsByName = this._clipsByName;
 
-    // Play idle
+    // Play idle — store action for lerp-based weight control
+    this._idleAction = null;
+    this._idleWeight = 1.0;
     if (clipsByName["ANI-ellie.idle"]) {
-      const idle = this.mixer.clipAction(clipsByName["ANI-ellie.idle"]);
-      idle.setEffectiveWeight(1.0);
-      idle.setLoop(THREE.LoopRepeat, Infinity);
-      idle.play();
+      this._idleAction = this.mixer.clipAction(clipsByName["ANI-ellie.idle"]);
+      this._idleAction.setEffectiveWeight(1.0);
+      this._idleAction.setLoop(THREE.LoopRepeat, Infinity);
+      this._idleAction.play();
     }
+
+    // Animate command state — queued with smooth lerp transitions
+    this._animateTargets = {};
+    this._animateActions = {};
+    this._animateQueue = [];
+    this._animatePlaying = false;
 
     // Only create actions for clips the signal mapper uses — other clips
     // may have material/color tracks that corrupt the model's appearance
@@ -217,13 +225,25 @@ export class AvatarController {
   applySignal(signal) {
     if (!this._actions) return;
 
-    // Avatar animate command — set clip weights directly from stream markers.
-    // These persist in _animateWeights and overlay viseme-driven weights.
+    // Avatar animate command — queue with smooth lerp transitions between poses.
     if (signal.type === "animate" && signal.clips) {
-      // Queue animate commands — each plays for at least 2s before the next
-      if (!this._animateQueue) this._animateQueue = [];
+      // Ensure actions exist for all referenced clips
+      for (const [name] of Object.entries(signal.clips)) {
+        if (!this._animateActions[name]) {
+          const clip = this._clipsByName[name];
+          if (!clip) continue;
+          // Use raw clips (with bone tracks) — idle and animate weights
+          // are crossfaded to always sum to 1.0, preventing T-pose bleed.
+          const action = this.mixer.clipAction(clip);
+          action.setEffectiveWeight(0);
+          action.setLoop(THREE.LoopRepeat, Infinity);
+          action.play();
+          this._animateActions[name] = action;
+        }
+      }
+      // Push to queue, start processing if not already
       this._animateQueue.push(signal.clips);
-      if (!this._animatePlaying) this._playNextAnimate();
+      if (!this._animatePlaying) this._advanceAnimateQueue();
       return;
     }
 
@@ -240,57 +260,38 @@ export class AvatarController {
     }
   }
 
-  _playNextAnimate() {
-    if (!this._animateQueue || this._animateQueue.length === 0) {
+  _advanceAnimateQueue() {
+    if (this._animateQueue.length === 0) {
       this._animatePlaying = false;
-      // Restore idle when queue is empty
-      this.mixer.stopAllAction();
-      const idle = this._clipsByName["ANI-ellie.idle"];
-      if (idle) {
-        const act = this.mixer.clipAction(idle);
-        act.reset();
-        act.setEffectiveWeight(1);
-        act.setLoop(THREE.LoopRepeat, Infinity);
-        act.play();
+      // Fade all animate clips to 0, idle back to 1
+      for (const name of Object.keys(this._animateTargets)) {
+        this._animateTargets[name] = 0;
       }
-      // Restart signal-driven actions at weight 0
-      for (const action of Object.values(this._actions)) {
-        action.reset();
-        action.setEffectiveWeight(0);
-        action.setLoop(THREE.LoopRepeat, Infinity);
-        action.play();
-      }
+      this._idleWeight = 1.0;
       if (this.debugEl) this.debugEl.textContent = "idle";
       return;
     }
     this._animatePlaying = true;
     const clips = this._animateQueue.shift();
 
-    // Stop everything, play requested clips + idle at low weight
-    this.mixer.stopAllAction();
+    // Zero out previous targets (they'll fade out via lerp)
+    for (const name of Object.keys(this._animateTargets)) {
+      if (!(name in clips)) this._animateTargets[name] = 0;
+    }
+    // Set new targets
     for (const [name, weight] of Object.entries(clips)) {
-      const clip = this._clipsByName[name];
-      if (!clip) continue;
-      const action = this.mixer.clipAction(clip);
-      action.reset();
-      action.setEffectiveWeight(weight);
-      action.setLoop(THREE.LoopRepeat, Infinity);
-      action.play();
+      this._animateTargets[name] = weight;
     }
-    const idle = this._clipsByName["ANI-ellie.idle"];
-    if (idle) {
-      const act = this.mixer.clipAction(idle);
-      act.reset();
-      act.setEffectiveWeight(0.3);
-      act.setLoop(THREE.LoopRepeat, Infinity);
-      act.play();
-    }
+    // Crossfade: idle → 0, animate → target. Both lerp at same rate
+    // so total bone weight stays ~1.0, preventing T-pose bleed.
+    this._idleWeight = 0.0;
+
     if (this.debugEl) {
       this.debugEl.textContent = `animate: ${Object.keys(clips).join(", ")}`;
     }
 
-    // Hold for 2.5s then play next in queue
-    setTimeout(() => this._playNextAnimate(), 2500);
+    // Hold for 2.5s then advance to next in queue
+    setTimeout(() => this._advanceAnimateQueue(), 2500);
   }
 
   animate() {
@@ -313,6 +314,25 @@ export class AvatarController {
         const newWeight = current + (target - current) * Math.min(1, speed * dt);
         action.setEffectiveWeight(newWeight);
       }
+    }
+
+    // Smooth animate-command transitions (full-body clips from stream markers)
+    const ANIMATE_LERP = 4;
+    if (this._animateActions) {
+      for (const [name, action] of Object.entries(this._animateActions)) {
+        const target = this._animateTargets[name] ?? 0;
+        const current = action.getEffectiveWeight();
+        const newWeight = current + (target - current) * Math.min(1, ANIMATE_LERP * dt);
+        action.setEffectiveWeight(newWeight);
+      }
+    }
+
+    // Smooth idle weight transition
+    if (this._idleAction) {
+      const current = this._idleAction.getEffectiveWeight();
+      const target = this._idleWeight ?? 1.0;
+      const newWeight = current + (target - current) * Math.min(1, ANIMATE_LERP * dt);
+      this._idleAction.setEffectiveWeight(newWeight);
     }
 
     if (this.mixer) this.mixer.update(dt);
