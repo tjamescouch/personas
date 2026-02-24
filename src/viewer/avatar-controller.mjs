@@ -1,72 +1,14 @@
 /**
- * Three.js scene controller for Ellie GLB model.
- *
- * Ellie's face is bone-driven (1867 bones per animation). Every animation
- * includes ALL bone tracks. Playing face animations alongside idle would
- * blend body bones toward T-pose.
- *
- * Solution: Strip face animations to ONLY face-bone tracks + morph target tracks.
- * Face-only clips blend safely with idle — idle controls body, face clips control face.
+ * Avatar controller — loads Ellie GLB, plays idle animation, and drives
+ * face/mouth/eye animations from LFS signals via clip action weights.
+ * Bone matrix override (monkey-patched skeleton.update) remains available
+ * for direct bone control if needed.
  */
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { SignalMapper } from "./signal-mapper.mjs";
-
-// Face bone name patterns (from Ellie's rig)
-// Face bones only — exclude Head/Neck so idle controls head movement
-const FACE_BONE_RE = /Lip|Eyelid|Eye_Ring|Eye\b|Cheek|Jaw|Brow|Nose|Chin|Tongue|Mouth|Pupil|Eyeball/i;
-
-// Known Three.js property suffixes
-const PROP_SUFFIXES = [".quaternion", ".position", ".scale"];
-
-/**
- * Extract the node name from a Three.js animation track name.
- * Track format: "NodeName.property" — but node names can contain dots (e.g. "Bone.L")
- * We split from the right on known property names.
- */
-function getNodeName(trackName) {
-  // Handle morphTargetInfluences (keep all morph tracks)
-  if (trackName.includes("morphTargetInfluences")) return null; // special: always keep
-
-  for (const suffix of PROP_SUFFIXES) {
-    if (trackName.endsWith(suffix)) {
-      return trackName.slice(0, -suffix.length);
-    }
-  }
-  return trackName;
-}
-
-/**
- * Create a new clip containing only face-bone tracks and morph target tracks.
- */
-function faceOnlyClip(clip) {
-  const faceTracks = clip.tracks.filter((t) => {
-    // Always keep morph target tracks
-    if (t.name.includes("morphTargetInfluences")) return true;
-    // Keep tracks for face bones
-    const nodeName = getNodeName(t.name);
-    return nodeName && FACE_BONE_RE.test(nodeName);
-  });
-
-  if (faceTracks.length === 0) return null;
-  return new THREE.AnimationClip(clip.name + "_face", clip.duration, faceTracks);
-}
-
-const LFS_CLIP_NAMES = [
-  "Ellie Mouth Aa", "Ellie mouth Ee", "Ellie mouth Eh",
-  "Ellie mouth Oo", "Ellie mouth Uu", "Ellie mouth squeeze",
-  "Ellie mouth smileclosed", "Ellie mouth smileclosed2", "Ellie mouth smileopen",
-  "Ellie eyemask content", "Ellie eyemask relaxed", "Ellie eyemask concerned",
-  "Ellie eyemask angry", "Ellie eyemask closed", "Ellie eyemask squint",
-  "Ellie eymask scared",
-  "Ellie face default", "Ellie face excited", "Ellie face awkward",
-  "Ellie face scared", "Ellie face scared2", "Ellie face annoyed",
-  "Ellie face suspicious", "Ellie face squint", "Ellie face wissle",
-  "RIG.Ellie_Eyebrows_Down",
-  "RIG.Ellie_Eyelid_Upper_Close-Open",
-  "RIG.Ellie_Eyelid_Lower_Close-Open",
-];
 
 export class AvatarController {
   constructor(container) {
@@ -82,23 +24,15 @@ export class AvatarController {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.2;
+    this.renderer.toneMappingExposure = 1.0;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(this.renderer.domElement);
 
-    // Lighting
-    const keyLight = new THREE.DirectionalLight(0xfff5e6, 2.0);
-    keyLight.position.set(2, 3, 3);
-    this.scene.add(keyLight);
-    const fillLight = new THREE.DirectionalLight(0xb4c7e7, 0.8);
-    fillLight.position.set(-2, 2, 1);
-    this.scene.add(fillLight);
-    const rimLight = new THREE.DirectionalLight(0xffffff, 0.4);
-    rimLight.position.set(0, 2, -3);
-    this.scene.add(rimLight);
-    this.scene.add(new THREE.HemisphereLight(0xb1e1ff, 0x3d2b1f, 0.8));
+    // PBR environment map — required for metallic/reflective materials to look correct
+    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmremGenerator.fromScene(new RoomEnvironment()).texture;
+    pmremGenerator.dispose();
 
-    // Controls
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 1.3, 0);
     this.controls.enableDamping = true;
@@ -106,12 +40,12 @@ export class AvatarController {
     this.controls.update();
 
     this.mixer = null;
-    this.actions = {};
-    this.activeActions = {};
-    this.currentTargets = {};
     this.clock = new THREE.Clock();
     this.signalMapper = new SignalMapper();
     this.debugEl = null;
+
+    // Override state — written each frame, read by monkey-patched skeleton.update
+    this._boneOverride = null; // {matrix: Matrix4} or null
 
     window.addEventListener("resize", () => this._onResize());
   }
@@ -126,66 +60,177 @@ export class AvatarController {
     this.mixer = new THREE.AnimationMixer(gltf.scene);
 
     const clipsByName = {};
-    for (const clip of gltf.animations) {
-      clipsByName[clip.name] = clip;
-    }
+    for (const clip of gltf.animations) clipsByName[clip.name] = clip;
 
-    // --- Idle: full body, normal blending ---
+    // Play idle
     if (clipsByName["ANI-ellie.idle"]) {
       const idle = this.mixer.clipAction(clipsByName["ANI-ellie.idle"]);
       idle.setEffectiveWeight(1.0);
       idle.setLoop(THREE.LoopRepeat, Infinity);
       idle.play();
-      this.actions["ANI-ellie.idle"] = idle;
-      this.activeActions["ANI-ellie.idle"] = true;
     }
 
-    // --- Face animations: stripped to face-bone tracks only ---
-    let count = 0;
-    for (const name of LFS_CLIP_NAMES) {
-      const clip = clipsByName[name];
-      if (!clip) continue;
+    // Only create actions for clips the signal mapper uses — other clips
+    // may have material/color tracks that corrupt the model's appearance
+    const SIGNAL_CLIPS = new Set([
+      "Ellie Mouth Aa", "Ellie mouth Ee", "Ellie mouth Eh",
+      "Ellie mouth Oo", "Ellie mouth Uu", "Ellie mouth squeeze",
+      "Ellie mouth smileclosed", "Ellie mouth smileopen",
+      "Ellie face default", "Ellie face excited", "Ellie face awkward",
+      "Ellie face scared", "Ellie face annoyed", "Ellie face suspicious",
+      "Ellie face squint",
+      "Ellie eyemask content", "Ellie eyemask relaxed",
+      "Ellie eyemask concerned", "Ellie eyemask angry",
+      "RIG.Ellie_Eyelid_Upper_Close-Open", "RIG.Ellie_Eyebrows_Down",
+      "Ellie full cheerful", "Ellie full relaxed",
+    ]);
 
-      const stripped = faceOnlyClip(clip);
-      if (!stripped) {
-        console.warn(`No face tracks found in "${name}"`);
+    this._actions = {};
+    for (const [name, clip] of Object.entries(clipsByName)) {
+      if (name === "ANI-ellie.idle") continue;
+      if (!SIGNAL_CLIPS.has(name)) {
+        console.log(`Skipping clip "${name}" (not used by signal mapper)`);
         continue;
       }
-
-      const action = this.mixer.clipAction(stripped);
+      // Strip bone transform tracks — only keep morph targets.
+      // Face clips contain bone tracks for ALL bones (arms, legs, etc.)
+      // which pull the body toward T-pose. Morph targets only affect face geometry.
+      const safeClip = clip.clone();
+      safeClip.tracks = safeClip.tracks.filter((track) => {
+        const prop = track.name.split(".").pop();
+        const keep = prop === "morphTargetInfluences";
+        if (!keep) console.log(`  Stripped track "${track.name}" from "${name}"`);
+        return keep;
+      });
+      if (safeClip.tracks.length === 0) {
+        console.log(`Clip "${name}" has no safe tracks — skipping`);
+        continue;
+      }
+      const action = this.mixer.clipAction(safeClip);
       action.setEffectiveWeight(0);
       action.setLoop(THREE.LoopRepeat, Infinity);
-      this.actions[name] = action;
-      this.activeActions[name] = false;
-      count++;
+      action.play();
+      this._actions[name] = action;
+    }
+    this._targetWeights = {};
 
-      // Log first clip's stats
-      if (count === 1) {
-        console.log(`"${name}": ${clip.tracks.length} total → ${stripped.tracks.length} face tracks`);
-        // Sample face bone names
-        const faceNodes = new Set();
-        for (const t of stripped.tracks) {
-          if (!t.name.includes("morphTarget")) {
-            const n = getNodeName(t.name);
-            if (n) faceNodes.add(n);
-          }
+    console.log("Animation clips registered:", Object.keys(this._actions).join(", "));
+
+    // === Survey all meshes, hide static ones (internal structure like skull) ===
+    console.log("=== MESH SURVEY ===");
+    const allMeshes = [];
+    gltf.scene.traverse((obj) => {
+      if (obj.isMesh) {
+        allMeshes.push(obj);
+        obj.geometry.computeBoundingBox();
+        const bb = obj.geometry.boundingBox;
+        const kind = obj.isSkinnedMesh ? "SKINNED" : "STATIC";
+        console.log(`${kind} "${obj.name}" ` +
+          `verts: ${obj.geometry.attributes.position.count}, ` +
+          `bounds Y: [${bb.min.y.toFixed(2)}, ${bb.max.y.toFixed(2)}]`);
+
+        // Hide non-skinned meshes — they're internal structure (skull, etc.)
+        if (!obj.isSkinnedMesh) {
+          obj.visible = false;
+          console.log(`  → hidden (static mesh)`);
         }
-        console.log("Face bones sample:", [...faceNodes].slice(0, 15));
       }
+    });
+
+    // === Find DEF-Head in each skinned mesh ===
+    let targetMesh = null;
+    let targetBoneIndex = -1;
+
+    for (const mesh of allMeshes) {
+      if (!mesh.isSkinnedMesh) continue;
+      const bones = mesh.skeleton.bones;
+      for (let i = 0; i < bones.length; i++) {
+        if (bones[i].name === "DEF-Head") {
+          targetMesh = mesh;
+          targetBoneIndex = i;
+          console.log(`DEF-Head found in "${mesh.name}" skeleton at index ${i}`);
+          break;
+        }
+      }
+      if (targetMesh) break;
     }
 
-    console.log(`Loaded: idle + ${count} face-only clips`);
-    return Object.keys(this.actions);
+    if (!targetMesh) {
+      console.error("DEF-Head NOT FOUND! Listing head bones:");
+      for (const mesh of allMeshes) {
+        if (!mesh.isSkinnedMesh) continue;
+        for (let i = 0; i < mesh.skeleton.bones.length; i++) {
+          if (mesh.skeleton.bones[i].name.toLowerCase().includes("head")) {
+            console.log(`  ${mesh.name}[${i}]: ${mesh.skeleton.bones[i].name}`);
+          }
+        }
+      }
+      return [];
+    }
+
+    // === Verify skin weights reference this bone ===
+    const skinIndex = targetMesh.geometry.attributes.skinIndex;
+    const skinWeight = targetMesh.geometry.attributes.skinWeight;
+    let vertsBound = 0;
+    if (skinIndex && skinWeight) {
+      const count = skinIndex.count;
+      for (let v = 0; v < count; v++) {
+        for (let c = 0; c < skinIndex.itemSize; c++) {
+          const idx = skinIndex.array[v * skinIndex.itemSize + c];
+          const wt = skinWeight.array[v * skinWeight.itemSize + c];
+          if (idx === targetBoneIndex && wt > 0.01) {
+            vertsBound++;
+            break;
+          }
+        }
+      }
+      console.log(`Vertices bound to DEF-Head (bone ${targetBoneIndex}): ${vertsBound} / ${count}`);
+    }
+
+    // === Monkey-patch skeleton.update ===
+    const skeleton = targetMesh.skeleton;
+    const origUpdate = skeleton.update.bind(skeleton);
+    const self = this;
+    const boneIdx = targetBoneIndex;
+
+    skeleton.update = function () {
+      origUpdate();
+
+      // Apply our override AFTER normal computation
+      const override = self._boneOverride;
+      if (override) {
+        override.matrix.toArray(this.boneMatrices, boneIdx * 16);
+        if (this.boneTexture) {
+          this.boneTexture.needsUpdate = true;
+        }
+      }
+    };
+
+    // Save the rest-pose bone matrix (right after first skeleton.update)
+    skeleton.update();
+    this._restBoneMatrix = new THREE.Matrix4();
+    this._restBoneMatrix.fromArray(skeleton.boneMatrices, targetBoneIndex * 16);
+    console.log("Rest bone matrix diagonal:",
+      [0, 5, 10, 15].map(i => skeleton.boneMatrices[targetBoneIndex * 16 + i].toFixed(4)));
+
+    this._targetMesh = targetMesh;
+    this._targetBoneIndex = targetBoneIndex;
+
+    console.log("=== Avatar loaded — waiting for LFS signals ===");
+    return [];
   }
 
   applySignal(signal) {
-    const targets = this.signalMapper.map(signal);
-    Object.assign(this.currentTargets, targets);
+    if (!this._actions) return;
+    this._targetWeights = this.signalMapper.map(signal, signal.dt || 16);
 
+    // Debug display
     if (this.debugEl) {
-      const { v, c, e, dt, seq } = signal;
-      this.debugEl.textContent =
-        `v:${(v || "SIL").padEnd(3)} c:${(c ?? 0).toFixed(2)} e:${(e ?? 0).toFixed(2)} dt:${dt ?? 0}ms seq:${seq ?? "-"}`;
+      const v = signal.v || "?";
+      const c = (signal.c ?? 0).toFixed(2);
+      const e = (signal.e ?? 0).toFixed(2);
+      const dt = signal.dt ?? 0;
+      this.debugEl.textContent = `v:${v}  c:${c}  e:${e}  dt:${dt}ms  seq:${signal.seq ?? "-"}`;
     }
   }
 
@@ -193,29 +238,26 @@ export class AvatarController {
     requestAnimationFrame(() => this.animate());
     const dt = this.clock.getDelta();
 
-    for (const [name, targetWeight] of Object.entries(this.currentTargets)) {
-      const action = this.actions[name];
-      if (!action) continue;
+    // Smoothly interpolate action weights toward signal-driven targets
+    // (must run before mixer.update so weights take effect this frame)
+    if (this._actions && this._targetWeights) {
+      // Mouth animations: fast lerp for responsive lip sync
+      // Expressions: slower lerp for smooth emotional transitions
+      const MOUTH_LERP = 18;
+      const EXPR_LERP = 6;
 
-      const current = action.getEffectiveWeight();
-      const isBlink = name.includes("Eyelid");
-      const rate = isBlink ? 0.4 : 0.15;
-      let next = current + (targetWeight - current) * rate;
-      if (Math.abs(next) < 0.005) next = 0;
-      next = Math.max(0, next);
-
-      if (next > 0 && !this.activeActions[name]) {
-        action.play();
-        this.activeActions[name] = true;
-      } else if (next === 0 && this.activeActions[name] && name !== "ANI-ellie.idle") {
-        action.stop();
-        this.activeActions[name] = false;
+      for (const [name, action] of Object.entries(this._actions)) {
+        const target = this._targetWeights[name] ?? 0;
+        const current = action.getEffectiveWeight();
+        const isMouth = name.includes("outh") || name.includes("squeeze");
+        const speed = isMouth ? MOUTH_LERP : EXPR_LERP;
+        const newWeight = current + (target - current) * Math.min(1, speed * dt);
+        action.setEffectiveWeight(newWeight);
       }
-
-      action.setEffectiveWeight(next);
     }
 
     if (this.mixer) this.mixer.update(dt);
+
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }

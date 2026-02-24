@@ -80,27 +80,30 @@ export class SignalMapper {
     const targets = {};
 
     // ── Mouth: viseme → one animation active ──
+    // Weights must be high (>1) to overcome idle's contribution on shared bones.
+    // With idle at 1.0 and face at 3.0: face bones get 3/4 = 75% face influence.
     const activeAnim = VISEME_ANIM[v] || null;
     for (const m of MOUTH_ANIMS) {
-      targets[m] = m === activeAnim ? 0.8 : 0.0;
+      targets[m] = m === activeAnim ? 3.0 : 0.0;
     }
     // Smile blend from confidence
-    targets["Ellie mouth smileclosed"] = c > 0.85 && e < 0.15 ? (c - 0.85) * 3 : 0;
+    targets["Ellie mouth smileclosed"] = c > 0.85 && e < 0.15 ? (c - 0.85) * 10 : 0;
 
     // ── Expression: confidence/entropy → face + eyemask ──
+    // Weights boosted ~3-4x so face clips dominate shared bones over idle.
     const cN = Math.max(0, Math.min(1, c));
     const eN = Math.max(0, Math.min(1, e));
 
-    targets["Ellie eyemask content"] = cN * (1 - eN) * 0.6;
-    targets["Ellie eyemask relaxed"] = cN * 0.2;
-    targets["Ellie eyemask concerned"] = eN * 0.5;
-    targets["Ellie face default"] = (1 - eN) * cN * 0.3;
-    targets["Ellie face excited"] = cN > 0.9 && eN < 0.1 ? 0.3 : 0;
-    targets["Ellie face awkward"] = eN * (1 - cN) * 0.4;
-    targets["Ellie face scared"] = eN > 0.5 ? (eN - 0.5) * 0.6 : 0;
+    targets["Ellie eyemask content"] = cN * (1 - eN) * 2.0;
+    targets["Ellie eyemask relaxed"] = cN * 0.8;
+    targets["Ellie eyemask concerned"] = eN * 1.5;
+    targets["Ellie face default"] = (1 - eN) * cN * 1.0;
+    targets["Ellie face excited"] = cN > 0.9 && eN < 0.1 ? 1.0 : 0;
+    targets["Ellie face awkward"] = eN * (1 - cN) * 1.2;
+    targets["Ellie face scared"] = eN > 0.5 ? (eN - 0.5) * 2.0 : 0;
 
     // Eyebrows: entropy raises brows
-    targets["RIG.Ellie_Eyebrows_Down"] = -eN * 0.4; // negative = brows up
+    targets["RIG.Ellie_Eyebrows_Down"] = eN * 2.0;
 
     // ── Blink: dt > 400ms or ambient timer ──
     this.blinkCooldown -= dtFrame;
@@ -114,18 +117,14 @@ export class SignalMapper {
     }
 
     if (blink && this.blinkCooldown <= 0) {
-      targets["RIG.Ellie_Eyelid_Upper_Close-Open"] = 1.0;
+      targets["RIG.Ellie_Eyelid_Upper_Close-Open"] = 3.0;
       this.blinkCooldown = 800;
     } else {
       targets["RIG.Ellie_Eyelid_Upper_Close-Open"] = 0.0;
     }
 
-    // ── Idle: always present as base layer ──
-    targets["ANI-ellie.idle"] = 0.4;
-
-    // ── Body: subtle posture from sustained emotion ──
-    targets["Ellie full cheerful"] = cN > 0.8 ? (cN - 0.8) * 0.5 : 0;
-    targets["Ellie full relaxed"] = cN * (1 - eN) * 0.15;
+    // NOTE: idle NOT included in targets — stays at weight 1.0 set during load.
+    // This ensures Head/Neck bones get full idle animation (no bind-pose blending).
 
     return targets;
   }
