@@ -105,28 +105,22 @@ export class AvatarController {
     }
     this._targetWeights = {};
 
-    // === Survey all meshes, hide static ones, apply cyberpunk materials ===
+    // === Survey all meshes, assign per-category procedural materials ===
     const allMeshes = [];
-    const grimeMap = this._createGrimeMap();
+    this._materialCache = {};
 
     gltf.scene.traverse((obj) => {
-      if (obj.isMesh) {
-        allMeshes.push(obj);
-        if (!obj.isSkinnedMesh) {
-          obj.visible = false;
-        } else {
-          const hue = Math.random();
-          const baseColor = new THREE.Color().setHSL(hue, 0.3, 0.12);
-          const emissiveColor = new THREE.Color().setHSL(hue, 1.0, 0.4);
-          obj.material = new THREE.MeshStandardMaterial({
-            color: baseColor,
-            emissive: emissiveColor,
-            emissiveIntensity: 0.15,
-            roughnessMap: grimeMap,
-            metalness: 0.1,
-            roughness: 0.8,
-          });
-        }
+      if (!obj.isMesh) return;
+      allMeshes.push(obj);
+      if (!obj.isSkinnedMesh) {
+        obj.visible = false;
+        return;
+      }
+      const category = this._classifyMesh(obj.name);
+      if (category === "hidden") {
+        obj.visible = false;
+      } else {
+        obj.material = this._getMaterial(category);
       }
     });
 
@@ -337,13 +331,280 @@ export class AvatarController {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
   }
 
-  // ── Procedural cyberpunk materials ──
+  // ── Mesh classification ──
 
-  _createGrimeMap() {
+  _classifyMesh(name) {
+    const n = name.toLowerCase();
+    // Rig/paint helpers — always hide
+    if (n.includes("rig_helper") || n.includes("weight_paint_helper")) return "hidden";
+    // Eyes
+    if (n.includes("eye_highlight")) return "eye_highlight";
+    if (n.includes("eyel001_1") || n.includes("eyer001_1")) return "iris";
+    if (n.includes("eyel") || n.includes("eyer")) return "eye";
+    if (n.includes("eyelash") || n.includes("eyelid")) return "lash";
+    if (n.includes("eyebrow")) return "hair";
+    // Hair
+    if (n.includes("hair") || n.includes("hairgroom")) return "hair";
+    if (n.includes("scrunchy")) return "fabric";
+    // Mouth
+    if (n.includes("teeth")) return "teeth";
+    if (n.includes("tongue")) return "tongue";
+    // Clothing — jacket
+    if (n.includes("jacket_button") || n.includes("jacket_pin")) return "metal";
+    if (n.includes("jacket")) return "jacket";
+    // Clothing — lower
+    if (n.includes("trousers")) return "fabric";
+    if (n.includes("boots")) return "leather";
+    // Accessories
+    if (n.includes("watch")) return "metal";
+    if (n.includes("earring")) return "metal";
+    if (n.includes("fannypack_main")) return "fabric";
+    if (n.includes("fannypack")) return "metal"; // buckles, straps, zippers
+    if (n.includes("handkerchief")) return "fabric";
+    // Skin — body, head, face lines
+    if (n.includes("body")) return "skin";
+    if (n.includes("head")) return "skin";
+    if (n.includes("face_line")) return "skin";
+    // Fallback
+    return "skin";
+  }
+
+  // ── Per-category materials (cached) ──
+
+  _getMaterial(category) {
+    if (this._materialCache[category]) return this._materialCache[category];
+    const mat = this._createMaterial(category);
+    this._materialCache[category] = mat;
+    return mat;
+  }
+
+  _createMaterial(category) {
+    switch (category) {
+      case "skin":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.85, 0.65, 0.52),
+          roughness: 0.75,
+          metalness: 0.0,
+          roughnessMap: this._createSkinMap(),
+          emissive: new THREE.Color(0.15, 0.05, 0.03),
+          emissiveIntensity: 0.2,
+        });
+
+      case "eye":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.95, 0.95, 0.97),
+          roughness: 0.05,
+          metalness: 0.0,
+          emissive: new THREE.Color(0.1, 0.1, 0.12),
+          emissiveIntensity: 0.3,
+        });
+
+      case "iris":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.06, 0.12, 0.08),
+          roughness: 0.1,
+          metalness: 0.0,
+          emissive: new THREE.Color(0.02, 0.05, 0.03),
+          emissiveIntensity: 0.15,
+        });
+
+      case "eye_highlight":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(1.0, 1.0, 1.0),
+          emissive: new THREE.Color(1.0, 1.0, 1.0),
+          emissiveIntensity: 0.8,
+          transparent: true,
+          opacity: 0.9,
+          roughness: 0.0,
+          metalness: 0.0,
+        });
+
+      case "lash":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.05, 0.03, 0.02),
+          roughness: 0.9,
+          metalness: 0.0,
+        });
+
+      case "hair":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.18, 0.10, 0.06),
+          roughness: 0.55,
+          metalness: 0.0,
+          emissive: new THREE.Color(0.08, 0.04, 0.02),
+          emissiveIntensity: 0.15,
+        });
+
+      case "teeth":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.92, 0.9, 0.85),
+          roughness: 0.2,
+          metalness: 0.0,
+          emissive: new THREE.Color(0.1, 0.1, 0.08),
+          emissiveIntensity: 0.1,
+        });
+
+      case "tongue":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.75, 0.35, 0.35),
+          roughness: 0.7,
+          metalness: 0.0,
+          emissive: new THREE.Color(0.1, 0.02, 0.02),
+          emissiveIntensity: 0.15,
+        });
+
+      case "jacket":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.12, 0.14, 0.18),
+          roughness: 0.85,
+          metalness: 0.0,
+          roughnessMap: this._createFabricMap(),
+          emissive: new THREE.Color(0.02, 0.03, 0.05),
+          emissiveIntensity: 0.1,
+        });
+
+      case "fabric":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.22, 0.20, 0.25),
+          roughness: 0.80,
+          metalness: 0.0,
+          roughnessMap: this._createFabricMap(),
+          emissive: new THREE.Color(0.03, 0.02, 0.04),
+          emissiveIntensity: 0.08,
+        });
+
+      case "leather":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.15, 0.10, 0.07),
+          roughness: 0.6,
+          metalness: 0.05,
+          roughnessMap: this._createLeatherMap(),
+          emissive: new THREE.Color(0.03, 0.02, 0.01),
+          emissiveIntensity: 0.1,
+        });
+
+      case "metal":
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.7, 0.7, 0.72),
+          roughness: 0.2,
+          metalness: 0.9,
+          roughnessMap: this._createGrimeMap(),
+          emissive: new THREE.Color(0.05, 0.05, 0.06),
+          emissiveIntensity: 0.05,
+        });
+
+      default:
+        return new THREE.MeshStandardMaterial({
+          color: new THREE.Color(0.5, 0.5, 0.5),
+          roughness: 0.7,
+          metalness: 0.0,
+        });
+    }
+  }
+
+  // ── Procedural texture generators ──
+
+  _createSkinMap() {
     return this._proceduralTexture(512, (ctx, w, h) => {
+      // Base warm tone
+      ctx.fillStyle = "#c8a898";
+      ctx.fillRect(0, 0, w, h);
+      // Subtle warm/cool variation
+      for (let s = 64; s >= 4; s = Math.floor(s / 2)) {
+        ctx.globalAlpha = 0.08;
+        for (let y = 0; y < h; y += s) {
+          for (let x = 0; x < w; x += s) {
+            const r = 160 + Math.floor(Math.random() * 40);
+            const g = 130 + Math.floor(Math.random() * 30);
+            const b = 110 + Math.floor(Math.random() * 30);
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(x, y, s, s);
+          }
+        }
+      }
+      // Pore-like dots
+      ctx.globalAlpha = 0.06;
+      for (let i = 0; i < 800; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        const r = 0.5 + Math.random() * 1.5;
+        ctx.fillStyle = `rgba(100,70,60,0.4)`;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+  }
+
+  _createFabricMap() {
+    return this._proceduralTexture(256, (ctx, w, h) => {
       ctx.fillStyle = "#808080";
       ctx.fillRect(0, 0, w, h);
-      // Perlin-ish noise via layered random rects
+      // Crosshatch weave pattern
+      ctx.globalAlpha = 0.12;
+      ctx.strokeStyle = "#606060";
+      ctx.lineWidth = 1;
+      for (let y = 0; y < h; y += 3) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y + (Math.random() - 0.5) * 2);
+        ctx.stroke();
+      }
+      for (let x = 0; x < w; x += 3) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + (Math.random() - 0.5) * 2, h);
+        ctx.stroke();
+      }
+      // Random variation
+      ctx.globalAlpha = 0.1;
+      for (let s = 32; s >= 4; s = Math.floor(s / 2)) {
+        for (let y = 0; y < h; y += s) {
+          for (let x = 0; x < w; x += s) {
+            const v = 100 + Math.floor(Math.random() * 56);
+            ctx.fillStyle = `rgb(${v},${v},${v})`;
+            ctx.fillRect(x, y, s, s);
+          }
+        }
+      }
+    });
+  }
+
+  _createLeatherMap() {
+    return this._proceduralTexture(256, (ctx, w, h) => {
+      ctx.fillStyle = "#787070";
+      ctx.fillRect(0, 0, w, h);
+      // Irregular grain
+      for (let s = 32; s >= 2; s = Math.floor(s / 2)) {
+        ctx.globalAlpha = 0.12;
+        for (let y = 0; y < h; y += s) {
+          for (let x = 0; x < w; x += s) {
+            const v = 90 + Math.floor(Math.random() * 50);
+            ctx.fillStyle = `rgb(${v},${v},${v})`;
+            ctx.fillRect(x, y, s, s);
+          }
+        }
+      }
+      // Creases
+      ctx.globalAlpha = 0.2;
+      for (let i = 0; i < 30; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        const len = 10 + Math.random() * 40;
+        ctx.strokeStyle = `rgba(50,45,40,0.5)`;
+        ctx.lineWidth = 0.5 + Math.random() * 2;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + (Math.random() - 0.5) * len, y + Math.random() * len * 0.3);
+        ctx.stroke();
+      }
+    });
+  }
+
+  _createGrimeMap() {
+    return this._proceduralTexture(256, (ctx, w, h) => {
+      ctx.fillStyle = "#808080";
+      ctx.fillRect(0, 0, w, h);
       for (let s = 64; s >= 2; s = Math.floor(s / 2)) {
         ctx.globalAlpha = 0.15;
         for (let y = 0; y < h; y += s) {
@@ -354,26 +615,13 @@ export class AvatarController {
           }
         }
       }
-      // Dirt streaks
-      ctx.globalAlpha = 0.3;
-      for (let i = 0; i < 40; i++) {
-        const x = Math.random() * w;
-        const y = Math.random() * h;
-        const len = 20 + Math.random() * 80;
-        ctx.strokeStyle = `rgba(40,35,30,${0.3 + Math.random() * 0.4})`;
-        ctx.lineWidth = 1 + Math.random() * 4;
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-        ctx.lineTo(x + (Math.random() - 0.5) * len, y + Math.random() * len);
-        ctx.stroke();
-      }
       // Scuff marks
       ctx.globalAlpha = 0.2;
-      for (let i = 0; i < 20; i++) {
+      for (let i = 0; i < 15; i++) {
         const x = Math.random() * w;
         const y = Math.random() * h;
-        const r = 3 + Math.random() * 12;
-        ctx.fillStyle = `rgba(30,30,30,${0.3 + Math.random() * 0.3})`;
+        const r = 3 + Math.random() * 10;
+        ctx.fillStyle = `rgba(30,30,30,0.3)`;
         ctx.beginPath();
         ctx.ellipse(x, y, r, r * 0.4, Math.random() * Math.PI, 0, Math.PI * 2);
         ctx.fill();
