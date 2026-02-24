@@ -13,7 +13,7 @@ import { SignalMapper } from "./signal-mapper.mjs";
 export class AvatarController {
   constructor(container) {
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x1a1a2e);
+    this.scene.background = new THREE.Color(0x05050f);
 
     this.camera = new THREE.PerspectiveCamera(
       30, window.innerWidth / window.innerHeight, 0.1, 100
@@ -116,9 +116,11 @@ export class AvatarController {
 
     console.log("Animation clips registered:", Object.keys(this._actions).join(", "));
 
-    // === Survey all meshes, hide static ones (internal structure like skull) ===
+    // === Survey all meshes, hide static ones, apply cyberpunk materials ===
     console.log("=== MESH SURVEY ===");
     const allMeshes = [];
+    const cyberMats = this._createCyberpunkMaterials();
+
     gltf.scene.traverse((obj) => {
       if (obj.isMesh) {
         allMeshes.push(obj);
@@ -129,10 +131,28 @@ export class AvatarController {
           `verts: ${obj.geometry.attributes.position.count}, ` +
           `bounds Y: [${bb.min.y.toFixed(2)}, ${bb.max.y.toFixed(2)}]`);
 
-        // Hide non-skinned meshes — they're internal structure (skull, etc.)
         if (!obj.isSkinnedMesh) {
           obj.visible = false;
           console.log(`  → hidden (static mesh)`);
+        } else {
+          // Apply cyberpunk material based on mesh region
+          const name = obj.name.toLowerCase();
+          const midY = (bb.min.y + bb.max.y) / 2;
+          if (name.includes("hair") || name.includes("pony")) {
+            obj.material = cyberMats.hair;
+          } else if (name.includes("eye")) {
+            obj.material = cyberMats.eyes;
+          } else if (midY > 1.2) {
+            // Head region
+            obj.material = cyberMats.skin;
+          } else if (midY > 0.6) {
+            // Torso
+            obj.material = cyberMats.jacket;
+          } else {
+            // Lower body / limbs
+            obj.material = cyberMats.pants;
+          }
+          console.log(`  → cyberpunk material applied`);
         }
       }
     });
@@ -270,5 +290,179 @@ export class AvatarController {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  // ── Procedural cyberpunk materials ──
+
+  _createCyberpunkMaterials() {
+    return {
+      skin: new THREE.MeshPhysicalMaterial({
+        color: 0x1a1a2e,
+        emissive: 0x0d0d1a,
+        emissiveMap: this._proceduralTexture(512, (ctx, w, h) => {
+          // Circuit-trace skin pattern
+          ctx.fillStyle = "#0a0a18";
+          ctx.fillRect(0, 0, w, h);
+          ctx.strokeStyle = "#00ffff";
+          ctx.lineWidth = 0.5;
+          ctx.globalAlpha = 0.15;
+          for (let y = 0; y < h; y += 16) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            for (let x = 0; x < w; x += 8) {
+              ctx.lineTo(x, y + (Math.random() - 0.5) * 4);
+            }
+            ctx.stroke();
+          }
+          // Neon vein highlights
+          ctx.globalAlpha = 0.4;
+          ctx.strokeStyle = "#ff00ff";
+          ctx.lineWidth = 1;
+          for (let i = 0; i < 8; i++) {
+            ctx.beginPath();
+            let x = Math.random() * w, y = Math.random() * h;
+            ctx.moveTo(x, y);
+            for (let j = 0; j < 6; j++) {
+              x += (Math.random() - 0.5) * 80;
+              y += Math.random() * 60;
+              ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+          }
+        }),
+        emissiveIntensity: 0.8,
+        metalness: 0.3,
+        roughness: 0.6,
+        clearcoat: 0.4,
+      }),
+
+      hair: new THREE.MeshPhysicalMaterial({
+        color: 0x0a0a1a,
+        emissive: 0xff00ff,
+        emissiveMap: this._proceduralTexture(256, (ctx, w, h) => {
+          // Glowing fiber strands
+          ctx.fillStyle = "#000008";
+          ctx.fillRect(0, 0, w, h);
+          for (let i = 0; i < 200; i++) {
+            const x = Math.random() * w;
+            const bright = Math.random();
+            ctx.strokeStyle = bright > 0.7
+              ? `rgba(255,0,255,${0.3 + bright * 0.5})`
+              : `rgba(0,255,255,${0.1 + bright * 0.2})`;
+            ctx.lineWidth = 0.5 + Math.random();
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            let cx = x;
+            for (let y = 0; y < h; y += 10) {
+              cx += (Math.random() - 0.5) * 6;
+              ctx.lineTo(cx, y);
+            }
+            ctx.stroke();
+          }
+        }),
+        emissiveIntensity: 1.2,
+        metalness: 0.7,
+        roughness: 0.3,
+        sheen: 1.0,
+        sheenColor: new THREE.Color(0x00ffff),
+      }),
+
+      eyes: new THREE.MeshPhysicalMaterial({
+        color: 0x000000,
+        emissive: 0x00ffff,
+        emissiveIntensity: 2.0,
+        metalness: 1.0,
+        roughness: 0.0,
+        clearcoat: 1.0,
+      }),
+
+      jacket: new THREE.MeshPhysicalMaterial({
+        color: 0x0f0f1f,
+        emissiveMap: this._proceduralTexture(512, (ctx, w, h) => {
+          // Tech-jacket: grid + circuit board
+          ctx.fillStyle = "#080818";
+          ctx.fillRect(0, 0, w, h);
+          // Grid lines
+          ctx.strokeStyle = "#00ffff";
+          ctx.lineWidth = 0.5;
+          ctx.globalAlpha = 0.12;
+          for (let x = 0; x < w; x += 32) {
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+          }
+          for (let y = 0; y < h; y += 32) {
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+          }
+          // Circuit nodes
+          ctx.globalAlpha = 0.6;
+          ctx.fillStyle = "#ff00ff";
+          for (let i = 0; i < 30; i++) {
+            const x = Math.round(Math.random() * (w / 32)) * 32;
+            const y = Math.round(Math.random() * (h / 32)) * 32;
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, Math.PI * 2);
+            ctx.fill();
+            // Trace from node
+            ctx.strokeStyle = "#ff00ff";
+            ctx.lineWidth = 1;
+            ctx.globalAlpha = 0.3;
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + (Math.random() > 0.5 ? 32 : 0), y + (Math.random() > 0.5 ? 32 : 0));
+            ctx.stroke();
+          }
+          // Neon accent stripe
+          ctx.globalAlpha = 0.8;
+          const grd = ctx.createLinearGradient(0, h * 0.4, 0, h * 0.45);
+          grd.addColorStop(0, "transparent");
+          grd.addColorStop(0.5, "#ff00ff");
+          grd.addColorStop(1, "transparent");
+          ctx.fillStyle = grd;
+          ctx.fillRect(0, h * 0.4, w, h * 0.05);
+        }),
+        emissive: 0xffffff,
+        emissiveIntensity: 0.5,
+        metalness: 0.5,
+        roughness: 0.4,
+        clearcoat: 0.3,
+      }),
+
+      pants: new THREE.MeshPhysicalMaterial({
+        color: 0x0a0a1a,
+        emissiveMap: this._proceduralTexture(256, (ctx, w, h) => {
+          // Dark tech-pants with scanlines
+          ctx.fillStyle = "#050510";
+          ctx.fillRect(0, 0, w, h);
+          ctx.globalAlpha = 0.08;
+          ctx.fillStyle = "#00ffff";
+          for (let y = 0; y < h; y += 4) {
+            ctx.fillRect(0, y, w, 1);
+          }
+          // Side stripe
+          ctx.globalAlpha = 0.5;
+          const grd = ctx.createLinearGradient(w * 0.85, 0, w * 0.9, 0);
+          grd.addColorStop(0, "transparent");
+          grd.addColorStop(0.5, "#ff00ff");
+          grd.addColorStop(1, "transparent");
+          ctx.fillStyle = grd;
+          ctx.fillRect(w * 0.85, 0, w * 0.05, h);
+        }),
+        emissive: 0xffffff,
+        emissiveIntensity: 0.3,
+        metalness: 0.4,
+        roughness: 0.5,
+      }),
+    };
+  }
+
+  _proceduralTexture(size, drawFn) {
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    drawFn(ctx, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
   }
 }
