@@ -57,8 +57,6 @@
   <div id="overlay">
     <span id="status">Initializing...</span>
     <div id="controls">
-      <button id="btn-demo">Start Demo</button>
-      <button id="btn-wave">Wave</button>
       <button id="btn-reset">Reset</button>
     </div>
   </div>
@@ -79,14 +77,13 @@
 
   <script type="module">
     import * as THREE from "three";
-    import { AvatarController } from "./avatar-controller.mjs?v=43";
+    import { AvatarController } from "./avatar-controller.mjs?v=47";
     import { LfsClient } from "./lfs-client.mjs?v=24";
 
     const statusEl = document.getElementById("status");
     const debugEl = document.getElementById("signal-debug");
     const loadingEl = document.getElementById("loading");
     const loadFill = document.getElementById("load-fill");
-    const btnDemo = document.getElementById("btn-demo");
 
     // Load avatar
     const avatar = window._avatar = new AvatarController(document.body);
@@ -114,7 +111,7 @@
     const client = new LfsClient("/api/signals");
 
     client.on("signal", (sig) => {
-      if (sig.type) console.log("signal type:", sig.type, sig);
+      if (sig.type === "animate") console.log("animate:", sig.clips);
       avatar.applySignal(sig);
     });
 
@@ -125,41 +122,26 @@
 
     client.connect();
 
-    // Wave test button
-    document.getElementById("btn-wave").addEventListener("click", () => {
-      avatar.mixer.stopAllAction();
-      const clip = avatar._clipsByName["Ellie full waving"];
-      if (clip) {
-        const act = avatar.mixer.clipAction(clip);
-        act.reset();
-        act.setEffectiveWeight(1);
-        act.setLoop(THREE.LoopRepeat, Infinity);
-        act.play();
-        statusEl.textContent = "Playing: Ellie full waving";
-      }
-    });
-
-    // Reset button — restart idle
+    // Reset button — restart idle and clear animate queue
     document.getElementById("btn-reset").addEventListener("click", () => {
+      avatar._animState = "idle";
+      avatar._animQueue = [];
+      avatar._animCurrentAction = null;
+      avatar._animTargetAction = null;
       avatar.mixer.stopAllAction();
-      const idle = avatar._clipsByName["ANI-ellie.idle"];
-      if (idle) {
-        const act = avatar.mixer.clipAction(idle);
-        act.reset();
-        act.setEffectiveWeight(1);
-        act.setLoop(THREE.LoopRepeat, Infinity);
-        act.play();
-        statusEl.textContent = "Reset to idle";
+      if (avatar._idleAction) {
+        avatar._idleAction.reset();
+        avatar._idleAction.setEffectiveWeight(1);
+        avatar._idleAction.setLoop(THREE.LoopRepeat, Infinity);
+        avatar._idleAction.play();
       }
-    });
-
-    // Demo button
-    let demoActive = false;
-    btnDemo.addEventListener("click", async () => {
-      demoActive = !demoActive;
-      const endpoint = demoActive ? "/api/demo/start" : "/api/demo/stop";
-      await fetch(endpoint, { method: "POST" });
-      btnDemo.textContent = demoActive ? "Stop Demo" : "Start Demo";
+      for (const action of Object.values(avatar._actions)) {
+        action.reset();
+        action.setEffectiveWeight(0);
+        action.setLoop(THREE.LoopRepeat, Infinity);
+        action.play();
+      }
+      statusEl.textContent = "Reset to idle";
     });
   </script>
 </body>

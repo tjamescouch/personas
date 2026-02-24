@@ -231,6 +231,8 @@ export class AvatarController {
 
     // Avatar animate command — sigmoid blend transitions via state machine.
     if (signal.type === "animate" && signal.clips) {
+      // Cap queue at 3 — drop oldest if full to prevent endless buildup
+      if (this._animQueue.length >= 3) this._animQueue.shift();
       this._animQueue.push(signal.clips);
       // Kick off transition if idle
       if (this._animState === "idle") {
@@ -269,7 +271,8 @@ export class AvatarController {
       const action = this.mixer.clipAction(clip);
       action.reset();
       action.setEffectiveWeight(0);
-      action.setLoop(THREE.LoopRepeat, Infinity);
+      action.setLoop(THREE.LoopOnce);
+      action.clampWhenFinished = true;
       action.play();
       action._targetWeight = weight;
       if (weight > bestWeight) { bestAction = action; bestWeight = weight; }
@@ -281,7 +284,8 @@ export class AvatarController {
 
   _startNextTransition() {
     if (this._animQueue.length === 0) {
-      // Nothing queued — fade current back to idle
+      // Nothing queued — fade current back to idle, then stop
+      this._animTargetAction = null;
       if (this._animState === "holding" && this._animCurrentAction) {
         this._animState = "fade_to_idle";
         this._animTransitionT = 0;
@@ -339,9 +343,15 @@ export class AvatarController {
         }
         if (this._idleAction) this._idleAction.setEffectiveWeight(1);
         this._animCurrentAction = null;
-        // Now fade idle → target
-        this._animState = "fade_to_target";
-        this._animTransitionT = 0;
+        // Fade to target if one exists, otherwise stay idle
+        if (this._animTargetAction) {
+          this._animState = "fade_to_target";
+          this._animTransitionT = 0;
+        } else {
+          this._animState = "idle";
+          this._animQueue = []; // clear any late-arriving stragglers
+          if (this.debugEl) this.debugEl.textContent = "idle";
+        }
       }
 
     } else if (this._animState === "fade_to_target") {
