@@ -61,9 +61,8 @@ export class AvatarController {
     for (const clip of gltf.animations) this._clipsByName[clip.name] = clip;
     const clipsByName = this._clipsByName;
 
-    // Play idle — store action for lerp-based weight control
+    // Play idle
     this._idleAction = null;
-    this._idleWeight = 1.0;
     if (clipsByName["ANI-ellie.idle"]) {
       this._idleAction = this.mixer.clipAction(clipsByName["ANI-ellie.idle"]);
       this._idleAction.setEffectiveWeight(1.0);
@@ -71,11 +70,16 @@ export class AvatarController {
       this._idleAction.play();
     }
 
-    // Animate command state — queued with smooth lerp transitions
-    this._animateTargets = {};
-    this._animateActions = {};
-    this._animateQueue = [];
-    this._animatePlaying = false;
+    // Animate transition state machine
+    // States: "idle" | "fade_to_idle" | "fade_to_target" | "holding"
+    this._animState = "idle";
+    this._animQueue = [];
+    this._animCurrentAction = null;   // the action currently playing/fading
+    this._animTargetAction = null;    // the action we're fading toward
+    this._animTransitionT = 0;        // progress through current transition [0-1]
+    this._animHoldTimer = 0;          // time remaining in hold phase
+    this._animFadeDuration = 0.5;     // seconds per fade phase
+    this._animHoldDuration = 2.0;     // seconds to hold each pose
 
     // Only create actions for clips the signal mapper uses — other clips
     // may have material/color tracks that corrupt the model's appearance
@@ -225,25 +229,13 @@ export class AvatarController {
   applySignal(signal) {
     if (!this._actions) return;
 
-    // Avatar animate command — queue with smooth lerp transitions between poses.
+    // Avatar animate command — sigmoid blend transitions via state machine.
     if (signal.type === "animate" && signal.clips) {
-      // Ensure actions exist for all referenced clips
-      for (const [name] of Object.entries(signal.clips)) {
-        if (!this._animateActions[name]) {
-          const clip = this._clipsByName[name];
-          if (!clip) continue;
-          // Use raw clips (with bone tracks) — idle and animate weights
-          // are crossfaded to always sum to 1.0, preventing T-pose bleed.
-          const action = this.mixer.clipAction(clip);
-          action.setEffectiveWeight(0);
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          action.play();
-          this._animateActions[name] = action;
-        }
+      this._animQueue.push(signal.clips);
+      // Kick off transition if idle
+      if (this._animState === "idle") {
+        this._startNextTransition();
       }
-      // Push to queue, start processing if not already
-      this._animateQueue.push(signal.clips);
-      if (!this._animatePlaying) this._advanceAnimateQueue();
       return;
     }
 
@@ -260,38 +252,140 @@ export class AvatarController {
     }
   }
 
-  _advanceAnimateQueue() {
-    if (this._animateQueue.length === 0) {
-      this._animatePlaying = false;
-      // Fade all animate clips to 0, idle back to 1
-      for (const name of Object.keys(this._animateTargets)) {
-        this._animateTargets[name] = 0;
+  // Sigmoid smoothstep: slow start, fast middle, slow end
+  _sigmoid(t) {
+    const c = Math.max(0, Math.min(1, t));
+    return c * c * (3 - 2 * c);
+  }
+
+  // Create and start an action from a clip dict { name: weight }
+  // Returns the action with the highest target weight.
+  _createAnimateAction(clips) {
+    let bestAction = null;
+    let bestWeight = 0;
+    for (const [name, weight] of Object.entries(clips)) {
+      const clip = this._clipsByName[name];
+      if (!clip) continue;
+      const action = this.mixer.clipAction(clip);
+      action.reset();
+      action.setEffectiveWeight(0);
+      action.setLoop(THREE.LoopRepeat, Infinity);
+      action.play();
+      action._targetWeight = weight;
+      if (weight > bestWeight) { bestAction = action; bestWeight = weight; }
+    }
+    // Store all actions for this pose so we can weight them together
+    if (bestAction) bestAction._poseClips = clips;
+    return bestAction;
+  }
+
+  _startNextTransition() {
+    if (this._animQueue.length === 0) {
+      // Nothing queued — fade current back to idle
+      if (this._animState === "holding" && this._animCurrentAction) {
+        this._animState = "fade_to_idle";
+        this._animTransitionT = 0;
+        if (this.debugEl) this.debugEl.textContent = "→ idle";
+      } else {
+        this._animState = "idle";
+        if (this.debugEl) this.debugEl.textContent = "idle";
       }
-      this._idleWeight = 1.0;
-      if (this.debugEl) this.debugEl.textContent = "idle";
       return;
     }
-    this._animatePlaying = true;
-    const clips = this._animateQueue.shift();
 
-    // Zero out previous targets (they'll fade out via lerp)
-    for (const name of Object.keys(this._animateTargets)) {
-      if (!(name in clips)) this._animateTargets[name] = 0;
+    const clips = this._animQueue.shift();
+    const targetAction = this._createAnimateAction(clips);
+    if (!targetAction) {
+      this._startNextTransition();
+      return;
     }
-    // Set new targets
-    for (const [name, weight] of Object.entries(clips)) {
-      this._animateTargets[name] = weight;
+    this._animTargetAction = targetAction;
+
+    if (this._animState === "idle") {
+      // Directly fade idle → target
+      this._animState = "fade_to_target";
+      this._animTransitionT = 0;
+    } else {
+      // Fade current → idle first, then idle → target
+      this._animState = "fade_to_idle";
+      this._animTransitionT = 0;
     }
-    // Crossfade: idle → 0, animate → target. Both lerp at same rate
-    // so total bone weight stays ~1.0, preventing T-pose bleed.
-    this._idleWeight = 0.0;
 
     if (this.debugEl) {
-      this.debugEl.textContent = `animate: ${Object.keys(clips).join(", ")}`;
+      this.debugEl.textContent = `→ ${Object.keys(clips).join(", ")}`;
     }
+  }
 
-    // Hold for 2.5s then advance to next in queue
-    setTimeout(() => this._advanceAnimateQueue(), 2500);
+  // Called every frame from animate() to drive the transition state machine
+  _updateAnimTransition(dt) {
+    if (this._animState === "idle") return;
+
+    const step = dt / this._animFadeDuration;
+
+    if (this._animState === "fade_to_idle") {
+      // Blend current animate action → idle
+      this._animTransitionT += step;
+      const t = this._sigmoid(this._animTransitionT);
+      if (this._animCurrentAction) {
+        this._setActionWeights(this._animCurrentAction, 1 - t);
+      }
+      if (this._idleAction) {
+        this._idleAction.setEffectiveWeight(t);
+      }
+      if (this._animTransitionT >= 1) {
+        // Current fully faded, stop it
+        if (this._animCurrentAction) {
+          this._setActionWeights(this._animCurrentAction, 0);
+        }
+        if (this._idleAction) this._idleAction.setEffectiveWeight(1);
+        this._animCurrentAction = null;
+        // Now fade idle → target
+        this._animState = "fade_to_target";
+        this._animTransitionT = 0;
+      }
+
+    } else if (this._animState === "fade_to_target") {
+      // Blend idle → target animate action
+      this._animTransitionT += step;
+      const t = this._sigmoid(this._animTransitionT);
+      if (this._idleAction) {
+        this._idleAction.setEffectiveWeight(1 - t);
+      }
+      if (this._animTargetAction) {
+        this._setActionWeights(this._animTargetAction, t);
+      }
+      if (this._animTransitionT >= 1) {
+        // Target fully faded in
+        if (this._idleAction) this._idleAction.setEffectiveWeight(0);
+        if (this._animTargetAction) {
+          this._setActionWeights(this._animTargetAction, 1);
+        }
+        this._animCurrentAction = this._animTargetAction;
+        this._animTargetAction = null;
+        this._animState = "holding";
+        this._animHoldTimer = this._animHoldDuration;
+      }
+
+    } else if (this._animState === "holding") {
+      this._animHoldTimer -= dt;
+      if (this._animHoldTimer <= 0) {
+        this._startNextTransition();
+      }
+    }
+  }
+
+  // Set weights for all clips in a pose action, scaled by blend factor
+  _setActionWeights(action, blend) {
+    if (action._poseClips) {
+      for (const [name, weight] of Object.entries(action._poseClips)) {
+        const clip = this._clipsByName[name];
+        if (!clip) continue;
+        const a = this.mixer.clipAction(clip);
+        a.setEffectiveWeight(weight * blend);
+      }
+    } else {
+      action.setEffectiveWeight(blend);
+    }
   }
 
   animate() {
@@ -316,24 +410,8 @@ export class AvatarController {
       }
     }
 
-    // Smooth animate-command transitions (full-body clips from stream markers)
-    const ANIMATE_LERP = 4;
-    if (this._animateActions) {
-      for (const [name, action] of Object.entries(this._animateActions)) {
-        const target = this._animateTargets[name] ?? 0;
-        const current = action.getEffectiveWeight();
-        const newWeight = current + (target - current) * Math.min(1, ANIMATE_LERP * dt);
-        action.setEffectiveWeight(newWeight);
-      }
-    }
-
-    // Smooth idle weight transition
-    if (this._idleAction) {
-      const current = this._idleAction.getEffectiveWeight();
-      const target = this._idleWeight ?? 1.0;
-      const newWeight = current + (target - current) * Math.min(1, ANIMATE_LERP * dt);
-      this._idleAction.setEffectiveWeight(newWeight);
-    }
+    // Drive animate transition state machine
+    this._updateAnimTransition(dt);
 
     if (this.mixer) this.mixer.update(dt);
 
@@ -402,37 +480,37 @@ export class AvatarController {
     switch (category) {
       case "skin":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.85, 0.65, 0.52),
-          roughness: 0.75,
+          color: new THREE.Color(0.55, 0.42, 0.38),
+          roughness: 0.95,
           metalness: 0.0,
           roughnessMap: this._createSkinMap(),
-          emissive: new THREE.Color(0.15, 0.05, 0.03),
-          emissiveIntensity: 0.2,
+          emissive: new THREE.Color(0.0, 0.03, 0.06),
+          emissiveIntensity: 0.15,
         });
 
       case "eye":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.95, 0.95, 0.97),
-          roughness: 0.05,
+          color: new THREE.Color(0.08, 0.08, 0.1),
+          roughness: 0.3,
           metalness: 0.0,
-          emissive: new THREE.Color(0.1, 0.1, 0.12),
-          emissiveIntensity: 0.3,
+          emissive: new THREE.Color(0.15, 0.15, 0.2),
+          emissiveIntensity: 0.4,
         });
 
       case "iris":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.06, 0.12, 0.08),
-          roughness: 0.1,
+          color: new THREE.Color(0.0, 0.15, 0.2),
+          roughness: 0.2,
           metalness: 0.0,
-          emissive: new THREE.Color(0.02, 0.05, 0.03),
-          emissiveIntensity: 0.15,
+          emissive: new THREE.Color(0.0, 0.8, 1.0),
+          emissiveIntensity: 0.6,
         });
 
       case "eye_highlight":
         return new THREE.MeshStandardMaterial({
           color: new THREE.Color(1.0, 1.0, 1.0),
-          emissive: new THREE.Color(1.0, 1.0, 1.0),
-          emissiveIntensity: 0.8,
+          emissive: new THREE.Color(0.5, 0.9, 1.0),
+          emissiveIntensity: 1.2,
           transparent: true,
           opacity: 0.9,
           roughness: 0.0,
@@ -441,83 +519,86 @@ export class AvatarController {
 
       case "lash":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.05, 0.03, 0.02),
-          roughness: 0.9,
+          color: new THREE.Color(0.02, 0.02, 0.03),
+          roughness: 1.0,
           metalness: 0.0,
         });
 
       case "hair":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.18, 0.10, 0.06),
-          roughness: 0.55,
+          color: new THREE.Color(0.05, 0.03, 0.08),
+          roughness: 0.85,
           metalness: 0.0,
-          emissive: new THREE.Color(0.08, 0.04, 0.02),
-          emissiveIntensity: 0.15,
+          emissive: new THREE.Color(0.15, 0.0, 0.3),
+          emissiveIntensity: 0.2,
         });
 
       case "teeth":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.92, 0.9, 0.85),
-          roughness: 0.2,
+          color: new THREE.Color(0.85, 0.85, 0.9),
+          roughness: 0.5,
           metalness: 0.0,
-          emissive: new THREE.Color(0.1, 0.1, 0.08),
+          emissive: new THREE.Color(0.05, 0.05, 0.1),
           emissiveIntensity: 0.1,
         });
 
       case "tongue":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.75, 0.35, 0.35),
-          roughness: 0.7,
+          color: new THREE.Color(0.5, 0.2, 0.25),
+          roughness: 0.9,
           metalness: 0.0,
-          emissive: new THREE.Color(0.1, 0.02, 0.02),
-          emissiveIntensity: 0.15,
+          emissive: new THREE.Color(0.08, 0.01, 0.02),
+          emissiveIntensity: 0.1,
         });
 
       case "jacket":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.12, 0.14, 0.18),
-          roughness: 0.85,
+          color: new THREE.Color(0.06, 0.06, 0.1),
+          roughness: 0.92,
           metalness: 0.0,
           roughnessMap: this._createFabricMap(),
-          emissive: new THREE.Color(0.02, 0.03, 0.05),
-          emissiveIntensity: 0.1,
+          emissiveMap: this._createCircuitMap(),
+          emissive: new THREE.Color(0.0, 0.6, 0.8),
+          emissiveIntensity: 0.25,
         });
 
       case "fabric":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.22, 0.20, 0.25),
-          roughness: 0.80,
+          color: new THREE.Color(0.08, 0.06, 0.12),
+          roughness: 0.92,
           metalness: 0.0,
           roughnessMap: this._createFabricMap(),
-          emissive: new THREE.Color(0.03, 0.02, 0.04),
-          emissiveIntensity: 0.08,
+          emissive: new THREE.Color(0.2, 0.0, 0.4),
+          emissiveIntensity: 0.12,
         });
 
       case "leather":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.15, 0.10, 0.07),
-          roughness: 0.6,
-          metalness: 0.05,
+          color: new THREE.Color(0.06, 0.05, 0.08),
+          roughness: 0.8,
+          metalness: 0.0,
           roughnessMap: this._createLeatherMap(),
-          emissive: new THREE.Color(0.03, 0.02, 0.01),
-          emissiveIntensity: 0.1,
+          emissive: new THREE.Color(0.0, 0.15, 0.2),
+          emissiveIntensity: 0.15,
         });
 
       case "metal":
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.7, 0.7, 0.72),
-          roughness: 0.2,
-          metalness: 0.9,
+          color: new THREE.Color(0.3, 0.32, 0.35),
+          roughness: 0.45,
+          metalness: 0.7,
           roughnessMap: this._createGrimeMap(),
-          emissive: new THREE.Color(0.05, 0.05, 0.06),
-          emissiveIntensity: 0.05,
+          emissive: new THREE.Color(0.0, 0.5, 0.6),
+          emissiveIntensity: 0.15,
         });
 
       default:
         return new THREE.MeshStandardMaterial({
-          color: new THREE.Color(0.5, 0.5, 0.5),
-          roughness: 0.7,
+          color: new THREE.Color(0.1, 0.1, 0.15),
+          roughness: 0.9,
           metalness: 0.0,
+          emissive: new THREE.Color(0.0, 0.1, 0.15),
+          emissiveIntensity: 0.1,
         });
     }
   }
@@ -526,31 +607,82 @@ export class AvatarController {
 
   _createSkinMap() {
     return this._proceduralTexture(512, (ctx, w, h) => {
-      // Base warm tone
-      ctx.fillStyle = "#c8a898";
+      // Cool-toned base
+      ctx.fillStyle = "#8a7878";
       ctx.fillRect(0, 0, w, h);
-      // Subtle warm/cool variation
+      // Subtle cool variation
       for (let s = 64; s >= 4; s = Math.floor(s / 2)) {
         ctx.globalAlpha = 0.08;
         for (let y = 0; y < h; y += s) {
           for (let x = 0; x < w; x += s) {
-            const r = 160 + Math.floor(Math.random() * 40);
-            const g = 130 + Math.floor(Math.random() * 30);
-            const b = 110 + Math.floor(Math.random() * 30);
+            const r = 110 + Math.floor(Math.random() * 30);
+            const g = 105 + Math.floor(Math.random() * 25);
+            const b = 115 + Math.floor(Math.random() * 35);
             ctx.fillStyle = `rgb(${r},${g},${b})`;
             ctx.fillRect(x, y, s, s);
           }
         }
       }
       // Pore-like dots
-      ctx.globalAlpha = 0.06;
-      for (let i = 0; i < 800; i++) {
+      ctx.globalAlpha = 0.05;
+      for (let i = 0; i < 600; i++) {
         const x = Math.random() * w;
         const y = Math.random() * h;
         const r = 0.5 + Math.random() * 1.5;
-        ctx.fillStyle = `rgba(100,70,60,0.4)`;
+        ctx.fillStyle = `rgba(60,70,90,0.4)`;
         ctx.beginPath();
         ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Faint circuit traces under the skin
+      ctx.globalAlpha = 0.04;
+      ctx.strokeStyle = "#40c0d0";
+      ctx.lineWidth = 0.5;
+      for (let i = 0; i < 15; i++) {
+        let x = Math.random() * w;
+        let y = Math.random() * h;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        for (let j = 0; j < 5; j++) {
+          if (Math.random() > 0.5) x += 10 + Math.random() * 30;
+          else y += 10 + Math.random() * 30;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    });
+  }
+
+  _createCircuitMap() {
+    return this._proceduralTexture(512, (ctx, w, h) => {
+      // Black base — only the circuit lines glow
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, w, h);
+      // Circuit traces
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.7;
+      for (let i = 0; i < 25; i++) {
+        let x = Math.random() * w;
+        let y = Math.random() * h;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        for (let j = 0; j < 4 + Math.floor(Math.random() * 4); j++) {
+          // Right-angle turns like PCB traces
+          if (Math.random() > 0.5) x += (Math.random() > 0.5 ? 1 : -1) * (15 + Math.random() * 40);
+          else y += (Math.random() > 0.5 ? 1 : -1) * (15 + Math.random() * 40);
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      // Junction nodes
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "#ffffff";
+      for (let i = 0; i < 30; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.beginPath();
+        ctx.arc(x, y, 1.5 + Math.random() * 2, 0, Math.PI * 2);
         ctx.fill();
       }
     });
