@@ -1,8 +1,9 @@
 /**
  * Avatar controller — loads Ellie GLB, plays idle animation, and drives
  * face/mouth/eye animations from LFS signals via clip action weights.
- * Bone matrix override (monkey-patched skeleton.update) remains available
- * for direct bone control if needed.
+ *
+ * On load, reports a full capabilities manifest (animations, bones, morph
+ * targets) to the server so upstream models know what the body can do.
  */
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -43,9 +44,6 @@ export class AvatarController {
     this.clock = new THREE.Clock();
     this.signalMapper = new SignalMapper();
     this.debugEl = null;
-
-    // Override state — written each frame, read by monkey-patched skeleton.update
-    this._boneOverride = null; // {matrix: Matrix4} or null
 
     window.addEventListener("resize", () => this._onResize());
   }
@@ -88,24 +86,16 @@ export class AvatarController {
     this._actions = {};
     for (const [name, clip] of Object.entries(clipsByName)) {
       if (name === "ANI-ellie.idle") continue;
-      if (!SIGNAL_CLIPS.has(name)) {
-        console.log(`Skipping clip "${name}" (not used by signal mapper)`);
-        continue;
-      }
+      if (!SIGNAL_CLIPS.has(name)) continue;
       // Strip bone transform tracks — only keep morph targets.
       // Face clips contain bone tracks for ALL bones (arms, legs, etc.)
       // which pull the body toward T-pose. Morph targets only affect face geometry.
       const safeClip = clip.clone();
       safeClip.tracks = safeClip.tracks.filter((track) => {
         const prop = track.name.split(".").pop();
-        const keep = prop === "morphTargetInfluences";
-        if (!keep) console.log(`  Stripped track "${track.name}" from "${name}"`);
-        return keep;
+        return prop === "morphTargetInfluences";
       });
-      if (safeClip.tracks.length === 0) {
-        console.log(`Clip "${name}" has no safe tracks — skipping`);
-        continue;
-      }
+      if (safeClip.tracks.length === 0) continue;
       const action = this.mixer.clipAction(safeClip);
       action.setEffectiveWeight(0);
       action.setLoop(THREE.LoopRepeat, Infinity);
@@ -114,28 +104,16 @@ export class AvatarController {
     }
     this._targetWeights = {};
 
-    console.log("Animation clips registered:", Object.keys(this._actions).join(", "));
-
     // === Survey all meshes, hide static ones, apply cyberpunk materials ===
-    console.log("=== MESH SURVEY ===");
     const allMeshes = [];
-    const cyberMats = { _grimeMap: this._createGrimeMap() };
+    const grimeMap = this._createGrimeMap();
 
     gltf.scene.traverse((obj) => {
       if (obj.isMesh) {
         allMeshes.push(obj);
-        obj.geometry.computeBoundingBox();
-        const bb = obj.geometry.boundingBox;
-        const kind = obj.isSkinnedMesh ? "SKINNED" : "STATIC";
-        console.log(`${kind} "${obj.name}" ` +
-          `verts: ${obj.geometry.attributes.position.count}, ` +
-          `bounds Y: [${bb.min.y.toFixed(2)}, ${bb.max.y.toFixed(2)}]`);
-
         if (!obj.isSkinnedMesh) {
           obj.visible = false;
-          console.log(`  → hidden (static mesh)`);
         } else {
-          // Random cyberpunk color per mesh — dark base with neon tint
           const hue = Math.random();
           const baseColor = new THREE.Color().setHSL(hue, 0.3, 0.12);
           const emissiveColor = new THREE.Color().setHSL(hue, 1.0, 0.4);
@@ -143,96 +121,102 @@ export class AvatarController {
             color: baseColor,
             emissive: emissiveColor,
             emissiveIntensity: 0.15,
-            roughnessMap: cyberMats._grimeMap,
+            roughnessMap: grimeMap,
             metalness: 0.1,
             roughness: 0.8,
           });
-          console.log(`  → random color hue:${(hue * 360).toFixed(0)}°`);
         }
       }
     });
 
-    // === Find DEF-Head in each skinned mesh ===
-    let targetMesh = null;
-    let targetBoneIndex = -1;
+    // === Build capabilities manifest ===
+    // Collect all animation clip info
+    const animations = gltf.animations.map((clip) => {
+      const trackTypes = new Set();
+      const targetNames = new Set();
+      for (const track of clip.tracks) {
+        const prop = track.name.split(".").pop();
+        trackTypes.add(prop);
+        // Extract the object name (before the first dot)
+        const objName = track.name.split(".")[0];
+        if (objName) targetNames.add(objName);
+      }
+      return {
+        name: clip.name,
+        duration: Math.round(clip.duration * 1000) / 1000,
+        trackCount: clip.tracks.length,
+        trackTypes: [...trackTypes],
+        active: clip.name in this._actions || clip.name === "ANI-ellie.idle",
+      };
+    });
 
+    // Collect bone hierarchy from first skinned mesh
+    const bones = [];
+    const boneHierarchy = {};
     for (const mesh of allMeshes) {
       if (!mesh.isSkinnedMesh) continue;
-      const bones = mesh.skeleton.bones;
-      for (let i = 0; i < bones.length; i++) {
-        if (bones[i].name === "DEF-Head") {
-          targetMesh = mesh;
-          targetBoneIndex = i;
-          console.log(`DEF-Head found in "${mesh.name}" skeleton at index ${i}`);
-          break;
+      for (const bone of mesh.skeleton.bones) {
+        bones.push(bone.name);
+        if (bone.parent && bone.parent.isBone) {
+          boneHierarchy[bone.name] = bone.parent.name;
         }
       }
-      if (targetMesh) break;
+      break; // only need first skeleton
     }
 
-    if (!targetMesh) {
-      console.error("DEF-Head NOT FOUND! Listing head bones:");
-      for (const mesh of allMeshes) {
-        if (!mesh.isSkinnedMesh) continue;
-        for (let i = 0; i < mesh.skeleton.bones.length; i++) {
-          if (mesh.skeleton.bones[i].name.toLowerCase().includes("head")) {
-            console.log(`  ${mesh.name}[${i}]: ${mesh.skeleton.bones[i].name}`);
-          }
-        }
+    // Collect morph targets from all skinned meshes
+    const morphTargets = {};
+    for (const mesh of allMeshes) {
+      if (!mesh.isSkinnedMesh) continue;
+      const dict = mesh.morphTargetDictionary;
+      if (dict && Object.keys(dict).length > 0) {
+        morphTargets[mesh.name] = Object.keys(dict);
       }
-      return [];
     }
 
-    // === Verify skin weights reference this bone ===
-    const skinIndex = targetMesh.geometry.attributes.skinIndex;
-    const skinWeight = targetMesh.geometry.attributes.skinWeight;
-    let vertsBound = 0;
-    if (skinIndex && skinWeight) {
-      const count = skinIndex.count;
-      for (let v = 0; v < count; v++) {
-        for (let c = 0; c < skinIndex.itemSize; c++) {
-          const idx = skinIndex.array[v * skinIndex.itemSize + c];
-          const wt = skinWeight.array[v * skinWeight.itemSize + c];
-          if (idx === targetBoneIndex && wt > 0.01) {
-            vertsBound++;
-            break;
-          }
-        }
-      }
-      console.log(`Vertices bound to DEF-Head (bone ${targetBoneIndex}): ${vertsBound} / ${count}`);
-    }
+    // Collect mesh info
+    const meshes = allMeshes
+      .filter((m) => m.isSkinnedMesh)
+      .map((m) => {
+        m.geometry.computeBoundingBox();
+        const bb = m.geometry.boundingBox;
+        return {
+          name: m.name,
+          vertices: m.geometry.attributes.position.count,
+          boundsY: [
+            Math.round(bb.min.y * 100) / 100,
+            Math.round(bb.max.y * 100) / 100,
+          ],
+          hasMorphTargets: !!(m.morphTargetDictionary && Object.keys(m.morphTargetDictionary).length > 0),
+        };
+      });
 
-    // === Monkey-patch skeleton.update ===
-    const skeleton = targetMesh.skeleton;
-    const origUpdate = skeleton.update.bind(skeleton);
-    const self = this;
-    const boneIdx = targetBoneIndex;
-
-    skeleton.update = function () {
-      origUpdate();
-
-      // Apply our override AFTER normal computation
-      const override = self._boneOverride;
-      if (override) {
-        override.matrix.toArray(this.boneMatrices, boneIdx * 16);
-        if (this.boneTexture) {
-          this.boneTexture.needsUpdate = true;
-        }
-      }
+    this._capabilities = {
+      animations,
+      bones,
+      boneHierarchy,
+      morphTargets,
+      meshes,
+      activeClips: Object.keys(this._actions),
     };
 
-    // Save the rest-pose bone matrix (right after first skeleton.update)
-    skeleton.update();
-    this._restBoneMatrix = new THREE.Matrix4();
-    this._restBoneMatrix.fromArray(skeleton.boneMatrices, targetBoneIndex * 16);
-    console.log("Rest bone matrix diagonal:",
-      [0, 5, 10, 15].map(i => skeleton.boneMatrices[targetBoneIndex * 16 + i].toFixed(4)));
+    // POST capabilities to server so upstream models can discover the body
+    this._reportCapabilities();
 
-    this._targetMesh = targetMesh;
-    this._targetBoneIndex = targetBoneIndex;
+    console.log("=== Avatar loaded — capabilities reported to server ===");
+  }
 
-    console.log("=== Avatar loaded — waiting for LFS signals ===");
-    return [];
+  /** Send capabilities manifest to the server. */
+  async _reportCapabilities() {
+    try {
+      await fetch("/api/avatar/capabilities", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this._capabilities),
+      });
+    } catch (e) {
+      console.warn("Failed to report capabilities:", e);
+    }
   }
 
   applySignal(signal) {

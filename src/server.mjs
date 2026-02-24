@@ -29,6 +29,9 @@ const sseClients = new Set();
 const signalBuffer = [];
 const BUFFER_MAX = 200;
 
+// Avatar capabilities manifest (posted by viewer on load)
+let avatarCapabilities = null;
+
 export function broadcastSignal(signal) {
   const data = `data: ${JSON.stringify(signal)}\n\n`;
   for (const res of sseClients) {
@@ -138,6 +141,26 @@ const server = createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, count: signals.length });
     } catch (e) {
       sendJson(res, 400, { error: "Invalid JSON" });
+    }
+    return;
+  }
+
+  // Avatar capabilities — posted by viewer on load, served to callers on GET
+  if (method === "POST" && path === "/api/avatar/capabilities") {
+    try {
+      avatarCapabilities = await readBody(req);
+      console.log(`Avatar capabilities received: ${avatarCapabilities.animations?.length} animations, ${avatarCapabilities.bones?.length} bones`);
+      sendJson(res, 200, { ok: true });
+    } catch (e) {
+      sendJson(res, 400, { error: "Invalid JSON" });
+    }
+    return;
+  }
+  if (method === "GET" && path === "/api/avatar/capabilities") {
+    if (!avatarCapabilities) {
+      sendJson(res, 404, { error: "No avatar connected yet" });
+    } else {
+      sendJson(res, 200, avatarCapabilities);
     }
     return;
   }
