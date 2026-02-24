@@ -165,6 +165,18 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Avatar animation commands — from gro stream markers @@[clip:weight]@@
+  if (method === "POST" && path === "/api/avatar/animate") {
+    try {
+      const body = await readBody(req);
+      broadcastSignal({ type: "animate", clips: body.clips || {} });
+      sendJson(res, 200, { ok: true });
+    } catch (e) {
+      sendJson(res, 400, { error: "Invalid JSON" });
+    }
+    return;
+  }
+
   // Demo controls
   if (method === "POST" && path === "/api/demo/start") {
     if (!demoModule) demoModule = await import("./demo.mjs");

@@ -57,8 +57,9 @@ export class AvatarController {
     this.scene.add(gltf.scene);
     this.mixer = new THREE.AnimationMixer(gltf.scene);
 
-    const clipsByName = {};
-    for (const clip of gltf.animations) clipsByName[clip.name] = clip;
+    this._clipsByName = {};
+    for (const clip of gltf.animations) this._clipsByName[clip.name] = clip;
+    const clipsByName = this._clipsByName;
 
     // Play idle
     if (clipsByName["ANI-ellie.idle"]) {
@@ -221,6 +222,18 @@ export class AvatarController {
 
   applySignal(signal) {
     if (!this._actions) return;
+
+    // Avatar animate command — set clip weights directly from stream markers.
+    // These persist in _animateWeights and overlay viseme-driven weights.
+    if (signal.type === "animate" && signal.clips) {
+      // Queue animate commands — each plays for at least 2s before the next
+      if (!this._animateQueue) this._animateQueue = [];
+      this._animateQueue.push(signal.clips);
+      if (!this._animatePlaying) this._playNextAnimate();
+      return;
+    }
+
+    // Viseme signal — signal mapper drives morph-target-only actions
     this._targetWeights = this.signalMapper.map(signal, signal.dt || 16);
 
     // Debug display
@@ -231,6 +244,59 @@ export class AvatarController {
       const dt = signal.dt ?? 0;
       this.debugEl.textContent = `v:${v}  c:${c}  e:${e}  dt:${dt}ms  seq:${signal.seq ?? "-"}`;
     }
+  }
+
+  _playNextAnimate() {
+    if (!this._animateQueue || this._animateQueue.length === 0) {
+      this._animatePlaying = false;
+      // Restore idle when queue is empty
+      this.mixer.stopAllAction();
+      const idle = this._clipsByName["ANI-ellie.idle"];
+      if (idle) {
+        const act = this.mixer.clipAction(idle);
+        act.reset();
+        act.setEffectiveWeight(1);
+        act.setLoop(THREE.LoopRepeat, Infinity);
+        act.play();
+      }
+      // Restart signal-driven actions at weight 0
+      for (const action of Object.values(this._actions)) {
+        action.reset();
+        action.setEffectiveWeight(0);
+        action.setLoop(THREE.LoopRepeat, Infinity);
+        action.play();
+      }
+      if (this.debugEl) this.debugEl.textContent = "idle";
+      return;
+    }
+    this._animatePlaying = true;
+    const clips = this._animateQueue.shift();
+
+    // Stop everything, play requested clips + idle at low weight
+    this.mixer.stopAllAction();
+    for (const [name, weight] of Object.entries(clips)) {
+      const clip = this._clipsByName[name];
+      if (!clip) continue;
+      const action = this.mixer.clipAction(clip);
+      action.reset();
+      action.setEffectiveWeight(weight);
+      action.setLoop(THREE.LoopRepeat, Infinity);
+      action.play();
+    }
+    const idle = this._clipsByName["ANI-ellie.idle"];
+    if (idle) {
+      const act = this.mixer.clipAction(idle);
+      act.reset();
+      act.setEffectiveWeight(0.3);
+      act.setLoop(THREE.LoopRepeat, Infinity);
+      act.play();
+    }
+    if (this.debugEl) {
+      this.debugEl.textContent = `animate: ${Object.keys(clips).join(", ")}`;
+    }
+
+    // Hold for 2.5s then play next in queue
+    setTimeout(() => this._playNextAnimate(), 2500);
   }
 
   animate() {
